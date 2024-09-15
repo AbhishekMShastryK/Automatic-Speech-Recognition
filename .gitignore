@@ -1,0 +1,5 @@
+dev_data/
+train_data/
+test_data/
+asr_env/
+__pycache__/
