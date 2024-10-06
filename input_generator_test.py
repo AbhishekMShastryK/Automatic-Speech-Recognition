@@ -1,12 +1,15 @@
 
 import numpy as np
 import input_generator
+import time
 '''
 # Use the following two lines to allow reloading the module
 # after you make quick changes of your implementation.
 from importlib import reload
 reload(input_generator)
 '''
+# Start timing
+start_time = time.time()
 
 # Tests for tokenizer.
 tokenizer = input_generator.CharacterTokenizer()
@@ -65,3 +68,7 @@ x_snapshot_expected = np.array([[-1.4427805 , -0.81610394, -0.1908448 , -1.22404
          1.9267566 ,  1.7878052 ,  1.599719  , -0.6094765 ,  0.42619205,
          0.95611477,  1.5003734 , -0.28901154]], dtype=np.float32)
 np.testing.assert_allclose(x_snapshot, x_snapshot_expected, rtol=1e-5, atol=1e-5)
+
+# End timing
+end_time = time.time()
+print(f"Execution time: {end_time - start_time} seconds")
