@@ -1,104 +1,110 @@
 import json
 import kaldiio
 import numpy as np
+import random
+import string
 
-# Task 1: Tokenizer
+
+def splice_and_subsample(x, context=0, sub_rate=1):
+    """Splice and subsample a sequence.
+
+    Args:
+        x: numpy array of shape [n, d]
+        context: int, the length of context in both left and right
+        sub_rate: int, subsampling rate
+
+    Returns:
+        Output array of shape [(n+subrate-1)//sub_rate, (2*context+1)*d].
+    """
+    y = []
+
+    # left context
+    for i in range(context, 0, -1):
+        y.append(np.concatenate([np.repeat(x[np.newaxis, 0, :], i, axis=0), x[:-i]], axis=0))
+
+    y.append(x)
+
+    # right context
+    for i in range(1, context + 1):
+        y.append(np.concatenate([x[i:], np.repeat(x[np.newaxis, -1, :], i, axis=0)], axis=0))
+
+    return np.concatenate(y, axis=1)[::sub_rate]
+
+
 class CharacterTokenizer:
+
     def __init__(self):
-        # Character-to-ID mapping (A=1, B=2,...Z=26, apostrophe=27, space=28)
-        self.char_to_id = {chr(i): i - 64 for i in range(65, 91)}  # A-Z
-        self.char_to_id[' '] = 28  # Space
-        self.char_to_id["'"] = 27  # Apostrophe
-        self.id_to_char = {v: k for k, v in self.char_to_id.items()}  # Reverse mapping
-    
-    def StringToIds(self, text):
-        # Converts a string into a list of integer IDs
-        return [self.char_to_id[char] for char in text]
-    
+        alphabet = string.ascii_uppercase
+        self.char_to_id = dict()
+        self.id_to_char = dict()
+        # id 0 is reserved for blank.
+        for i, c in enumerate(alphabet):
+            self.char_to_id[c] = i + 1
+            self.id_to_char[i+1] = c
+        # Apostrophy.
+        self.char_to_id["'"] = 27
+        self.id_to_char[27] = "'"
+        # Space.
+        self.char_to_id[" "] = 28
+        self.id_to_char[28] = " "
+
     def IdsToString(self, ids):
-        # Converts a list of IDs back into a string
-        return ''.join([self.id_to_char[i] for i in ids])
+        chars = map(lambda id: self.id_to_char[id], ids)
+        return "".join(chars).strip()
 
-# Task 2: Splice and Subsample
-def splice_and_subsample(input_feature_matrix, C, r):
-    # Get the number of frames (T)
-    T = input_feature_matrix.shape[0]
-    
-    # Step 1: Splicing
-    spliced_features = []
-    for t in range(T):
-        # Handle left context
-        if t - C < 0:  # If less than C frames to the left, pad by repeating the first frame
-            left_padding = np.tile(input_feature_matrix[0], (C - t, 1))
-            left_context = np.vstack((left_padding, input_feature_matrix[0:t]))
-        else:
-            left_context = input_feature_matrix[t - C:t]
+    def StringToIds(self, s):
+        return list(map(lambda char: self.char_to_id[char], s))
 
-        # Handle right context
-        if t + C >= T:  # If less than C frames to the right, pad by repeating the last frame
-            right_padding = np.tile(input_feature_matrix[T - 1], (t + C + 1 - T, 1))
-            right_context = np.vstack((input_feature_matrix[t+1:T], right_padding))
-        else:
-            right_context = input_feature_matrix[t + 1:t + C + 1]
-
-        # Concatenate left context, current frame, and right context
-        spliced_frame = np.concatenate((left_context, input_feature_matrix[t:t+1], right_context), axis=0)
-        spliced_features.append(spliced_frame.flatten())  # Flatten the spliced frame
-    
-    spliced_features = np.array(spliced_features)  # Convert to a numpy array
-    
-    # Step 2: Subsampling
-    T_prime = (T + r - 1) // r
-    subsampled_features = spliced_features[::r]  # Take every r-th frame
-    
-    return subsampled_features[:T_prime]
-
-# Task 3: Input Generator
 class InputGenerator:
-    def __init__(self, json_file, batch_size, shuffle, context_length, subsampling_rate):
-        # Load data from JSON file
-        with open(json_file, 'r') as f:
-            self.data = json.load(f)["utts"]  # Access the "utts" key in the JSON
+
+    def __init__(self, input_json, batch_size=1, shuffle=False, context_length=0, subsampling_rate=1):
+        with open(input_json, "rb") as f:
+            self.input_dict = json.load(f)['utts']
+
+        self.utterance_ids = list(self.input_dict.keys())
+        self.num_utterances = len(self.utterance_ids)
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.num_steps_per_epoch = self.num_utterances // self.batch_size
+        self.num_elements_to_pad = 0
+        remainder = self.num_utterances % batch_size
+        if remainder > 0:
+            self.num_steps_per_epoch += 1
+            self.num_elements_to_pad = self.batch_size - remainder
+
+        self.epoch = 0
+        self.step_in_epoch = 0
+        self.epoch_order = self.generate_epoch_order()
+        self.tokenizer = CharacterTokenizer()
+
         self.context_length = context_length
         self.subsampling_rate = subsampling_rate
-        self.epoch = 0
-        self.total_num_steps = 0
-        self.steps_in_epoch = 0
-        self.utterances = list(self.data.keys())  # Get list of utterances
-        
-        # Shuffle the utterances if required
-        if shuffle:
-            np.random.shuffle(self.utterances)
+
+    def generate_epoch_order(self):
+        epoch_order = list(range(self.num_utterances))
+        if self.shuffle:
+            random.shuffle(epoch_order)
+        if self.num_elements_to_pad > 0:
+            epoch_order = epoch_order + epoch_order[:self.num_elements_to_pad]
+        return epoch_order
 
     def next(self):
+        output = []
+        for i in range(self.step_in_epoch * self.batch_size, (self.step_in_epoch+1) * self.batch_size):
+            utterance_id = self.utterance_ids[self.epoch_order[i]]
+            d = self.input_dict[utterance_id]
+            x = splice_and_subsample(kaldiio.load_mat(d['feat']), self.context_length, self.subsampling_rate)
+            y = self.tokenizer.StringToIds(d['text'])
+            output.append((utterance_id, x, y))
 
-        batch = []
-        for _ in range(self.batch_size):
-            utt_id = self.utterances[self.steps_in_epoch]
-            features_path = self.data[utt_id]["feat"]  # This is the full ark path with offset
-            
-            # Load the acoustic features using kaldiio
-            features = kaldiio.load_mat(features_path)  # Pass the ark path directly to load_mat
-            
-            # Process the features with splicing and subsampling
-            spliced_subsampled_features = splice_and_subsample(features, self.context_length, self.subsampling_rate)
-            
-            tokenizer = CharacterTokenizer()  # Instantiate tokenizer
-            tokenized_transcript = tokenizer.StringToIds(self.data[utt_id]["text"])  # Tokenize the transcript
-            
-            batch.append((utt_id, spliced_subsampled_features, tokenized_transcript))  # Append the processed data
-            self.steps_in_epoch += 1
-            
-            # Check if we have finished an epoch
-            if self.steps_in_epoch == len(self.utterances):
-                self.epoch += 1
-                self.steps_in_epoch = 0
-                if self.shuffle:
-                    np.random.shuffle(self.utterances)
+        self.step_in_epoch += 1
+        if self.step_in_epoch == self.num_steps_per_epoch:
+            self.epoch += 1
+            self.step_in_epoch = 0
+            self.epoch_order = self.generate_epoch_order()
 
-        # Increment the total number of steps
-        self.total_num_steps += 1
-        return batch
+        return output
 
+    @property
+    def total_num_steps(self):
+        return self.num_steps_per_epoch * self.epoch + self.step_in_epoch

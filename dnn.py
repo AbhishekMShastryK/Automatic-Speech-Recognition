@@ -17,6 +17,7 @@ def compute_softmax(x):
     probs = out_exp / exp_sum
     return probs
 
+
 def compute_ce_loss(out, y, loss_mask):
     """Compute cross-entropy loss, averaged over valid training samples.
 
@@ -28,57 +29,33 @@ def compute_ce_loss(out, y, loss_mask):
     Returns:
         Cross entropy loss averaged over valid samples, and gradient wrt output.
     """
-    dout, batch_size = out.shape
-
-    # Compute softmax probabilities
+    batch = out.shape[1]
     probs = compute_softmax(out)
+    neg_log_probs = - np.log(probs)
 
-    # Convert labels to one-hot encoding
-    one_hot_labels = np.zeros_like(out)
-    one_hot_labels[y, np.arange(batch_size)] = 1.0
+    y_one_hot = np.zeros_like(out)
+    col_idx = np.arange(batch, dtype=np.int32)
+    rol_idx = np.array(y, dtype=np.int32)
+    y_one_hot[rol_idx, col_idx] = 1.0
+    loss_vec = np.sum(neg_log_probs * y_one_hot, 0)
+    loss = np.sum(loss_vec * loss_mask) / np.sum(loss_mask)
+    return loss, probs - y_one_hot
 
-    # Calculate cross-entropy loss per sample
-    log_probs = np.log(probs + 1e-12)  # Adding epsilon to avoid log(0)
-    per_sample_loss = -np.sum(one_hot_labels * log_probs, axis=0)
-
-    # Apply loss mask to cross-entropy loss
-    masked_loss = per_sample_loss * loss_mask
-
-    # Average the loss only over valid samples
-    valid_sample_count = np.sum(loss_mask)  # Sum of valid samples
-    if valid_sample_count > 0:
-        average_loss = np.sum(masked_loss) / valid_sample_count
-    else:
-        average_loss = 0.0
-
-    # Calculate gradient with respect to output
-    grad_out = (probs - one_hot_labels)  # Gradient of softmax cross-entropy loss
-    grad_out *= loss_mask[np.newaxis, :]  # Apply the mask to the gradient
-
-    return average_loss, grad_out
 
 class FeedForwardNetwork:
 
     def __init__(self, din, dout, num_hidden_layers, hidden_layer_width):
+        self.din = din
+        self.dout = dout
         self.num_hidden_layers = num_hidden_layers
-        self.hidden_layer_width = hidden_layer_width
-
-        # Initialize weights and biases
         self.weights = []
         self.biases = []
-
-        # First layer
-        self.weights.append(np.random.uniform(-0.05, 0.05, (hidden_layer_width, din)))
-        self.biases.append(np.zeros(hidden_layer_width))
-
-        # Hidden layers
-        for _ in range(num_hidden_layers - 1):
-            self.weights.append(np.random.uniform(-0.05, 0.05, (hidden_layer_width, hidden_layer_width)))
-            self.biases.append(np.zeros(hidden_layer_width))
-
-        # Output layer
-        self.weights.append(np.random.uniform(-0.05, 0.05, (dout, hidden_layer_width)))
-        self.biases.append(np.zeros(dout))
+        widths = [din] + [hidden_layer_width] * num_hidden_layers + [dout]
+        for i in range(self.num_hidden_layers+1):
+            w = np.random.uniform(-0.05, 0.05, size=[widths[i+1], widths[i]])
+            self.weights.append(w)
+            b = np.zeros(widths[i+1])
+            self.biases.append(b)
 
     def forward(self, x):
         """Forward the feedforward neural network.
@@ -90,18 +67,15 @@ class FeedForwardNetwork:
             Output of shape [dout, batch], and a list of hidden layer activations,
             each of the shape [hidden_layer_width, batch].
         """
-        activations = []
-        a = x
-
-        # Hidden layers with ReLU activation
-        for i in range(self.num_hidden_layers):
-            z = np.dot(self.weights[i], a) + self.biases[i][:, np.newaxis]
-            a = np.maximum(0, z)  # ReLU activation
-            activations.append(a)
-
-        # Output layer without activation
-        out = np.dot(self.weights[-1], a) + self.biases[-1][:, np.newaxis]
-        return out, activations
+        res = x
+        hidden = []
+        for i in range(self.num_hidden_layers+1):
+            res = np.matmul(self.weights[i], res) + self.biases[i][:, None]
+            if i < self.num_hidden_layers:
+                # Apply ReLU activation.
+                res[res < 0] = 0
+                hidden.append(res)
+        return res, hidden
 
     def backward(self, x, hidden, loss_grad, loss_mask):
         """Backpropagation of feedforward neural network.
@@ -115,39 +89,30 @@ class FeedForwardNetwork:
         Returns:
             Returns gradient, averaged over valid samples, with respect to weights and biases.
         """
-        grad_w = []
-        grad_b = []
+        num_samples = np.sum(loss_mask)
 
-        # Apply mask to loss gradient
-        delta = loss_grad * loss_mask[np.newaxis, :]
+        loss_grad = loss_grad * loss_mask[None, :]
+        # Last layer is linear, no activation.
+        # shape [dout, hidden_layer_width]
+        grad_w = [np.matmul(loss_grad, np.transpose(hidden[-1])) / num_samples]
+        grad_b = [np.sum(loss_grad, 1) / num_samples]
+        # shape [hidden_layer_width, n]
+        grad_hidden = np.matmul(np.transpose(self.weights[-1]), loss_grad)
 
-        # Gradient for the output layer
-        grad_w_out = np.dot(delta, hidden[-1].T)
-        grad_b_out = np.sum(delta, axis=1)
-
-        grad_w.insert(0, grad_w_out)
-        grad_b.insert(0, grad_b_out)
-
-        # Backpropagate through hidden layers
-        for i in range(self.num_hidden_layers - 1, -1, -1):
-            delta = np.dot(self.weights[i + 1].T, delta)
-            delta[hidden[i] <= 0] = 0  # ReLU derivative
-
-            if i == 0:
-                grad_w_hidden = np.dot(delta, x.T)
+        for i in range(self.num_hidden_layers-1, -1, -1):
+            activation = hidden[i]
+            # Gradient of ReLU activation.
+            # shape [hidden_layer_width, n]
+            grad_hidden[activation <= 0] = 0
+            grad_hidden *= loss_mask[None, :]
+            if i==0:
+                prev_activation = x
             else:
-                grad_w_hidden = np.dot(delta, hidden[i - 1].T)
-
-            grad_b_hidden = np.sum(delta, axis=1)
-
-            grad_w.insert(0, grad_w_hidden)
-            grad_b.insert(0, grad_b_hidden)
-
-        # Normalize gradients by the number of valid samples
-        valid_sample_count = np.sum(loss_mask)
-        if valid_sample_count > 0:
-            grad_w = [g / valid_sample_count for g in grad_w]
-            grad_b = [g / valid_sample_count for g in grad_b]
+                prev_activation = hidden[i-1]
+            grad_w.insert(0, np.matmul(grad_hidden, np.transpose(prev_activation)) / num_samples)
+            grad_b.insert(0, np.sum(grad_hidden, 1) / num_samples)
+            # shape [prev_layer_width, n]
+            grad_hidden = np.matmul(np.transpose(self.weights[i]), grad_hidden)
 
         return grad_w, grad_b
 
@@ -162,7 +127,7 @@ class FeedForwardNetwork:
         self.biases = [b + u for b, u in zip(self.biases, b_updates)]
 
     def predict(self, x):
-        """Compute predictions on a minibatch.
+        """Compute predictions on a minibath.
 
         Args:
             x: input, of shape [din, batch].
